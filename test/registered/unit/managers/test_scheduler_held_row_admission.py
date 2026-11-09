@@ -1,11 +1,8 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537)."""
 
 import unittest
-from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-
-import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -13,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -21,10 +18,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -146,61 +140,89 @@ class TestHeldRowAdmission(CustomTestCase):
         )
 
     def test_mixed_logprobs(self):
-        params = SamplingParams(max_new_tokens=8)
-        params.normalize(None)
-        prefill, decode = [
-            Req(rid, "", array("q", ids), params, return_logprob=True)
-            for rid, ids in (("prefill", [11, 12, 13]), ("decode", [21, 22, 23]))
-        ]
-        model = SimpleNamespace(is_encoder_decoder=False, vocab_size=128)
-        for req in (prefill, decode):
-            req.extend_end = 3
-        s = self._scheduler(DisaggregationMode.NULL, [decode], prefill, [])
-        s.model_config = model
-        s.req_to_token_pool.device = "cpu"
-        s.is_mixed_chunk = True
-        s.spec_algorithm = SpeculativeAlgorithm.NONE
-        s.hisparse_coordinator = None
-        s.enable_hierarchical_cache = s.enable_skip_finishing_decode = False
-        s.tp_worker.model_runner.prefill_aware_swa = False
-        s.enable_priority_scheduling = False
-        s.load_inquirer = Mock()
-        with (
-            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
-            patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_extend",
-                side_effect=[
-                    (torch.arange(3), torch.tensor([i]), torch.tensor([i]))
-                    for i in (1, 0)
-                ],
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                return_value=torch.tensor([6]),
-            ),
-            patch.object(ScheduleBatch, "check_decode_mem", return_value=True),
-            patch(
-                "sglang.srt.managers.scheduler.PrefillStats.from_adder",
-                return_value=None,
-            ),
+        for prefill_lp, decode_lp in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
         ):
-            running = ScheduleBatch(
-                reqs=[decode],
-                device="cpu",
-                model_config=model,
-                return_logprob=True,
-                spec_algorithm=s.spec_algorithm,
-            )
-            decode.init_next_round_input()
-            running.prepare_for_extend()
-            decode.output_ids.append(24)
-            batch, _ = s._get_new_batch_prefill_raw(None, running)
-        self.assertEqual(batch.forward_mode, ForwardMode.MIXED)
-        self.assertEqual(batch.reqs, [prefill, decode])
-        self.assertTrue(batch.return_logprob)
-        self.assertEqual(batch.extend_lens, [3, 1])
-        self.assertEqual(batch.extend_logprob_start_lens, [0, 1])
-        self.assertEqual(batch.extend_input_logprob_token_ids.tolist(), [12, 13, 0])
+            with self.subTest(prefill=prefill_lp, decode=decode_lp):
+                params = SamplingParams(max_new_tokens=8)
+                params.normalize(None)
+                prefill, decode = [
+                    Req(
+                        rid,
+                        "",
+                        array("q", ids),
+                        params,
+                        return_logprob=return_logprob,
+                    )
+                    for rid, ids, return_logprob in (
+                        ("prefill", [11, 12, 13], prefill_lp),
+                        ("decode", [21, 22, 23], decode_lp),
+                    )
+                ]
+                model = SimpleNamespace(is_encoder_decoder=False, vocab_size=128)
+                for req in (prefill, decode):
+                    req.extend_end = 3
+                s = self._scheduler(DisaggregationMode.NULL, [decode], prefill, [])
+                s.model_config = model
+                s.req_to_token_pool.device = "cpu"
+                s.is_mixed_chunk = True
+                s.spec_algorithm = SpeculativeAlgorithm.NONE
+                s.hisparse_coordinator = None
+                s.enable_hierarchical_cache = s.enable_skip_finishing_decode = False
+                s.tp_worker.model_runner.prefill_aware_swa = False
+                s.enable_priority_scheduling = False
+                s.load_inquirer = Mock()
+                with (
+                    get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_extend",
+                        side_effect=[
+                            (torch.arange(3), torch.tensor([i]), torch.tensor([i]))
+                            for i in (1, 0)
+                        ],
+                    ),
+                    patch(
+                        "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                        return_value=torch.tensor([6]),
+                    ),
+                    patch.object(ScheduleBatch, "check_decode_mem", return_value=True),
+                    patch(
+                        "sglang.srt.managers.scheduler.PrefillStats.from_adder",
+                        return_value=None,
+                    ),
+                ):
+                    running = ScheduleBatch(
+                        reqs=[decode],
+                        device="cpu",
+                        model_config=model,
+                        return_logprob=decode_lp,
+                        spec_algorithm=s.spec_algorithm,
+                    )
+                    decode.init_next_round_input()
+                    running.prepare_for_extend()
+                    decode.output_ids.append(24)
+                    batch, _ = s._get_new_batch_prefill_raw(None, running)
+
+                self.assertEqual(batch.forward_mode, ForwardMode.MIXED)
+                self.assertEqual(batch.reqs, [prefill, decode])
+                self.assertEqual(batch.return_logprob, prefill_lp or decode_lp)
+                self.assertEqual(batch.extend_lens, [3, 1])
+                self.assertEqual(
+                    batch.extend_logprob_start_lens,
+                    [
+                        3 if decode_lp and not prefill_lp else 0,
+                        int(prefill_lp or decode_lp),
+                    ],
+                )
+                if prefill_lp:
+                    self.assertEqual(
+                        batch.extend_input_logprob_token_ids.tolist(), [12, 13, 0]
+                    )
+                else:
+                    self.assertIsNone(batch.extend_input_logprob_token_ids)
 
     def test_final_chunk_leaves_the_free_row_to_a_waiting_request(self):
         for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
